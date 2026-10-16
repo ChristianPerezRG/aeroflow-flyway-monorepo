@@ -1,117 +1,36 @@
 name: Flyway GitHub Actions QA Workflow
-# Uses the official Redgate actions (red-gate/setup-flyway + red-gate/flyway-actions).
-# No pre-installed Flyway CLI needed - setup-flyway downloads and licenses it per job.
-# For the equivalent pipeline calling a pre-installed Flyway CLI, see the flyway-cli folder.
-#
-# MONOREPO: one workflow for every Flyway project. Each project has its own QA branch,
-# named QA/<Name> (e.g. QA/DemoDB), so projects are promoted independently.
-# The project is taken from the branch name, and the deploy only runs when that
-# project's migrations changed in this push.
+# Uses the Flyway CLI pre-installed on the self-hosted runner.
+# For the equivalent pipeline built on the official Redgate actions
+# (red-gate/setup-flyway + red-gate/flyway-actions), see the flyway-actions folder.
 on:
   push:
     branches:
-      - "QA/**"
+      - QA
     paths:
-      - "projects/*/migrations/**"
+      - "migrations/**"
 
-# Shared settings - the same for every project
+# Environment Variables
 env:
   # Repository Variables - Create these in Settings > Secrets and variables > Actions > Variables
   EMAIL: ${{ vars.USER_EMAIL }} # Email registered to your Flyway license
+  JDBC_QA: ${{ vars.JDBC_QA }} # e.g. jdbc:sqlserver://<host>;databaseName=<QADB>;trustServerCertificate=true
+
   # Repository Secrets - Create these in Settings > Secrets and variables > Actions > Secrets
   TOKEN: ${{ secrets.FLYWAY_TOKEN }} # Flyway license token (PAT)
+  DB_USER_QA: ${{ secrets.DB_USER_QA }}
+  DB_USER_PW_QA: ${{ secrets.DB_USER_PW_QA }}
 
 jobs:
-  # Works out the project from the branch name (QA/DemoDB -> DemoDB) and whether
-  # its migrations changed in this push. Merges that only carry other projects'
-  # changes skip the deploy.
-  detect:
-    name: Detect project
-    runs-on: self-hosted
-    outputs:
-      project: ${{ steps.detect.outputs.project }}
-      key: ${{ steps.detect.outputs.key }}
-      deploy: ${{ steps.detect.outputs.deploy }}
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 0 # Full history, so this push can be compared with the previous commit
-
-      - name: Detect project
-        id: detect
-        shell: pwsh
-        run: |
-          $project = '${{ github.ref_name }}'.Split('/', 2)[1]
-          if (-not (Test-Path "projects/$project/migrations")) { throw "Branch '${{ github.ref_name }}' has no matching project folder projects/$project/migrations" }
-          if ($project -notmatch '^[A-Za-z0-9_]+$') { throw "Project folder '$project' must use only letters, digits and underscores." }
-          $before = '${{ github.event.before }}'
-          git cat-file -e "$before^{commit}" 2>$null
-          if ($before -match '^0+$' -or $LASTEXITCODE -ne 0) {
-            Write-Host "New branch or no previous commit - nothing to promote yet, skipping deploy."
-            $deploy = $false
-          } else {
-            $deploy = [bool](git diff --name-only $before '${{ github.sha }}' -- "projects/$project/migrations")
-            if (-not $deploy) { Write-Host "No $project migration changes in this push - skipping deploy." }
-          }
-          "project=$project" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
-          "key=$($project.ToUpper())" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
-          "deploy=$($deploy.ToString().ToLower())" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
-
   flyway-deploy-qa:
-    name: Deploy ${{ needs.detect.outputs.project }} to QA
-    needs: detect
-    if: needs.detect.outputs.deploy == 'true'
     runs-on: self-hosted # Runner to execute the job
     # runs-on: ubuntu-latest
-
-    # Per-project settings. For project folder <Name>, create these with the name upper-cased:
-    #   Variable: JDBC_QA_<NAME>
-    #   Optional secrets: DB_USER_QA_<NAME>, DB_USER_PW_QA_<NAME>; when absent, the shared
-    #   DB_USER_QA / DB_USER_PW_QA secrets are used.
-    env:
-      PROJECT: ${{ needs.detect.outputs.project }}
-      JDBC_QA: ${{ vars[format('JDBC_QA_{0}', needs.detect.outputs.key)] }}
-      DB_USER_QA: ${{ secrets[format('DB_USER_QA_{0}', needs.detect.outputs.key)] || secrets.DB_USER_QA }}
-      DB_USER_PW_QA: ${{ secrets[format('DB_USER_PW_QA_{0}', needs.detect.outputs.key)] || secrets.DB_USER_PW_QA }}
+    defaults:
+      run:
+        shell: cmd # Default shell. Use Windows Command Prompt. bash for linux.
 
     steps: # Steps run strictly in order and stop on the first failure
       - uses: actions/checkout@v5 # Checks out the commit that triggered this run
 
-      - name: Check project settings
-        shell: pwsh
-        run: |
-          if (-not $env:JDBC_QA) { throw "Project ${env:PROJECT}: create repository variable JDBC_QA_${{ needs.detect.outputs.key }}" }
-
-      # NOTE: Windows runners only - not required on Linux runners, where bash is native.
-      # Git for Windows' default install puts only Git\cmd on PATH (git.exe, no bash.exe),
-      # so `shell: bash` inside the Flyway actions resolves to WSL's bash, which cannot
-      # read the Windows script path. This puts Git Bash ahead of it.
-      - name: Add Git Bash to PATH
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          "C:\Program Files\Git\bin" | Out-File $env:GITHUB_PATH -Append -Encoding utf8
-          "C:\Program Files\Git\usr\bin" | Out-File $env:GITHUB_PATH -Append -Encoding utf8
-
-      # Installs the Flyway CLI on the runner and adds it to PATH
-      - name: Setup Flyway
-        uses: red-gate/setup-flyway@v3
-        with:
-          version: "13.4.0" # Pin for reproducible runs - bump deliberately
-          edition: enterprise
-          i-agree-to-the-eula: true
-          email: ${{ env.EMAIL }}
-          token: ${{ env.TOKEN }}
-
-      # Drift check and snapshot are left at their defaults (enabled), so each QA
-      # deployment stores a snapshot - this is what makes drift detection meaningful.
-      - name: Deploy to QA
-        uses: red-gate/flyway-actions/migrations/deploy@v2
-        with:
-          working-directory: projects/${{ env.PROJECT }}
-          target-url: ${{ env.JDBC_QA }}
-          target-user: ${{ env.DB_USER_QA }}
-          target-password: ${{ env.DB_USER_PW_QA }}
-          deployment-report-name: flyway-qa-deployment-report-${{ env.PROJECT }}
-          drift-resolution-scripts-name: flyway-deploy-qa-drift-resolution-scripts-${{ env.PROJECT }}
+      - name: Deploy to QA # Applies pending migrations, with info before and after
+        # To use username and password instead of windows integrated security, ensure SQL Server is configured to allow SQL Server authentication. In SSMS check Server Properties > Security and select "SQL Server and Windows Authentication mode".
+        run: flyway -email="${{ env.EMAIL }}" -token="${{ env.TOKEN }}" info migrate info -user="${{ env.DB_USER_QA }}" -password="${{ env.DB_USER_PW_QA }}" -url="${{ env.JDBC_QA }}" -IAgreeToTheEula -locations="filesystem:${{ github.workspace }}/migrations" -configFiles="${{ github.workspace }}/flyway.toml" -baselineOnMigrate=true -errorOverrides=S0001:0:I-
