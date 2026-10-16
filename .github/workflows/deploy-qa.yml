@@ -2,31 +2,86 @@ name: Flyway GitHub Actions QA Workflow
 # Uses the official Redgate actions (red-gate/setup-flyway + red-gate/flyway-actions).
 # No pre-installed Flyway CLI needed - setup-flyway downloads and licenses it per job.
 # For the equivalent pipeline calling a pre-installed Flyway CLI, see the flyway-cli folder.
+#
+# MONOREPO: one workflow for every Flyway project. Each project has its own QA branch,
+# named QA/<Name> (e.g. QA/DemoDB), so projects are promoted independently.
+# The project is taken from the branch name, and the deploy only runs when that
+# project's migrations changed in this push.
 on:
   push:
     branches:
-      - QA
+      - "QA/**"
     paths:
-      - "projects/DemoDB/migrations/**"
+      - "projects/*/migrations/**"
 
-# Environment Variables
+# Shared settings - the same for every project
 env:
   # Repository Variables - Create these in Settings > Secrets and variables > Actions > Variables
   EMAIL: ${{ vars.USER_EMAIL }} # Email registered to your Flyway license
-  JDBC_QA: ${{ vars.JDBC_QA }} # e.g. jdbc:sqlserver://<host>;databaseName=<QADB>;trustServerCertificate=true
-
   # Repository Secrets - Create these in Settings > Secrets and variables > Actions > Secrets
   TOKEN: ${{ secrets.FLYWAY_TOKEN }} # Flyway license token (PAT)
-  DB_USER_QA: ${{ secrets.DB_USER_QA }}
-  DB_USER_PW_QA: ${{ secrets.DB_USER_PW_QA }}
 
 jobs:
+  # Works out the project from the branch name (QA/DemoDB -> DemoDB) and whether
+  # its migrations changed in this push. Merges that only carry other projects'
+  # changes skip the deploy.
+  detect:
+    name: Detect project
+    runs-on: self-hosted
+    outputs:
+      project: ${{ steps.detect.outputs.project }}
+      key: ${{ steps.detect.outputs.key }}
+      deploy: ${{ steps.detect.outputs.deploy }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # Full history, so this push can be compared with the previous commit
+
+      - name: Detect project
+        id: detect
+        shell: pwsh
+        run: |
+          $project = '${{ github.ref_name }}'.Split('/', 2)[1]
+          if (-not (Test-Path "projects/$project/migrations")) { throw "Branch '${{ github.ref_name }}' has no matching project folder projects/$project/migrations" }
+          if ($project -notmatch '^[A-Za-z0-9_]+$') { throw "Project folder '$project' must use only letters, digits and underscores." }
+          $before = '${{ github.event.before }}'
+          git cat-file -e "$before^{commit}" 2>$null
+          if ($before -match '^0+$' -or $LASTEXITCODE -ne 0) {
+            Write-Host "New branch or no previous commit - nothing to promote yet, skipping deploy."
+            $deploy = $false
+          } else {
+            $deploy = [bool](git diff --name-only $before '${{ github.sha }}' -- "projects/$project/migrations")
+            if (-not $deploy) { Write-Host "No $project migration changes in this push - skipping deploy." }
+          }
+          "project=$project" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "key=$($project.ToUpper())" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "deploy=$($deploy.ToString().ToLower())" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+
   flyway-deploy-qa:
+    name: Deploy ${{ needs.detect.outputs.project }} to QA
+    needs: detect
+    if: needs.detect.outputs.deploy == 'true'
     runs-on: self-hosted # Runner to execute the job
     # runs-on: ubuntu-latest
 
+    # Per-project settings. For project folder <Name>, create these with the name upper-cased:
+    #   Variable: JDBC_QA_<NAME>
+    #   Optional secrets: DB_USER_QA_<NAME>, DB_USER_PW_QA_<NAME>; when absent, the shared
+    #   DB_USER_QA / DB_USER_PW_QA secrets are used.
+    env:
+      PROJECT: ${{ needs.detect.outputs.project }}
+      JDBC_QA: ${{ vars[format('JDBC_QA_{0}', needs.detect.outputs.key)] }}
+      DB_USER_QA: ${{ secrets[format('DB_USER_QA_{0}', needs.detect.outputs.key)] || secrets.DB_USER_QA }}
+      DB_USER_PW_QA: ${{ secrets[format('DB_USER_PW_QA_{0}', needs.detect.outputs.key)] || secrets.DB_USER_PW_QA }}
+
     steps: # Steps run strictly in order and stop on the first failure
       - uses: actions/checkout@v5 # Checks out the commit that triggered this run
+
+      - name: Check project settings
+        shell: pwsh
+        run: |
+          if (-not $env:JDBC_QA) { throw "Project ${env:PROJECT}: create repository variable JDBC_QA_${{ needs.detect.outputs.key }}" }
 
       # NOTE: Windows runners only - not required on Linux runners, where bash is native.
       # Git for Windows' default install puts only Git\cmd on PATH (git.exe, no bash.exe),
@@ -54,8 +109,9 @@ jobs:
       - name: Deploy to QA
         uses: red-gate/flyway-actions/migrations/deploy@v2
         with:
-          working-directory: projects/DemoDB
+          working-directory: projects/${{ env.PROJECT }}
           target-url: ${{ env.JDBC_QA }}
           target-user: ${{ env.DB_USER_QA }}
           target-password: ${{ env.DB_USER_PW_QA }}
-          deployment-report-name: flyway-qa-deployment-report
+          deployment-report-name: flyway-qa-deployment-report-${{ env.PROJECT }}
+          drift-resolution-scripts-name: flyway-deploy-qa-drift-resolution-scripts-${{ env.PROJECT }}

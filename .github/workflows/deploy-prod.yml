@@ -2,30 +2,25 @@ name: Flyway GitHub Actions Production Workflow # Workflow name
 # Uses the official Redgate actions (red-gate/setup-flyway + red-gate/flyway-actions).
 # No pre-installed Flyway CLI needed - setup-flyway downloads and licenses it per job.
 # For the equivalent pipeline calling a pre-installed Flyway CLI, see the flyway-cli folder.
+#
+# MONOREPO: one workflow for every Flyway project. Each project has its own Production
+# branch, named Production/<Name> (e.g. Production/DemoDB), so projects are promoted
+# independently. The project is taken from the branch name, and the jobs only run when
+# that project's migrations changed in this push.
+# SINGLE PROD: Deploy Prod 2 job removed; the report targets PROD1.
 on:
   push:
     branches:
-      - Production
+      - "Production/**"
     paths:
-      - "projects/DemoDB/migrations/**"
+      - "projects/*/migrations/**"
 
-# Environment Variables
+# Shared settings - the same for every project
 env:
   # Repository Variables - Create these in Settings > Secrets and variables > Actions > Variables
   EMAIL: ${{ vars.USER_EMAIL }} # Email registered to your Flyway license
-  JDBC_PROD1: ${{ vars.JDBC_PROD1 }} # e.g. jdbc:sqlserver://<host>;databaseName=<Prod1DB>;trustServerCertificate=true
-  JDBC_PROD2: ${{ vars.JDBC_PROD2 }}
-  JDBC_CHECK: ${{ vars.JDBC_CHECK }} # Throwaway build DB used by the check report - wiped every run
-
   # Repository Secrets - Create these in Settings > Secrets and variables > Actions > Secrets
   TOKEN: ${{ secrets.FLYWAY_TOKEN }} # Flyway license token (PAT)
-  DB_USER_CHECK: ${{ secrets.DB_USER_CHECK }}
-  DB_USER_PW_CHECK: ${{ secrets.DB_USER_PW_CHECK }}
-  DB_USER_PROD1: ${{ secrets.DB_USER_PROD1 }}
-  DB_USER_PW_PROD1: ${{ secrets.DB_USER_PW_PROD1 }}
-  DB_USER_PROD2: ${{ secrets.DB_USER_PROD2 }}
-  DB_USER_PW_PROD2: ${{ secrets.DB_USER_PW_PROD2 }}
-  # End of Environment Secrets #
 
 # Required so the code review results can be uploaded to GitHub Code Scanning
 permissions:
@@ -34,12 +29,69 @@ permissions:
 
 # jobs are the steps executed in the workflow
 jobs:
+  # Works out the project from the branch name (Production/DemoDB -> DemoDB) and whether
+  # its migrations changed in this push. Merges that only carry other projects'
+  # changes skip the report and deploy.
+  detect:
+    name: Detect project
+    runs-on: self-hosted
+    outputs:
+      project: ${{ steps.detect.outputs.project }}
+      key: ${{ steps.detect.outputs.key }}
+      deploy: ${{ steps.detect.outputs.deploy }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # Full history, so this push can be compared with the previous commit
+
+      - name: Detect project
+        id: detect
+        shell: pwsh
+        run: |
+          $project = '${{ github.ref_name }}'.Split('/', 2)[1]
+          if (-not (Test-Path "projects/$project/migrations")) { throw "Branch '${{ github.ref_name }}' has no matching project folder projects/$project/migrations" }
+          if ($project -notmatch '^[A-Za-z0-9_]+$') { throw "Project folder '$project' must use only letters, digits and underscores." }
+          $before = '${{ github.event.before }}'
+          git cat-file -e "$before^{commit}" 2>$null
+          if ($before -match '^0+$' -or $LASTEXITCODE -ne 0) {
+            Write-Host "New branch or no previous commit - nothing to promote yet, skipping deploy."
+            $deploy = $false
+          } else {
+            $deploy = [bool](git diff --name-only $before '${{ github.sha }}' -- "projects/$project/migrations")
+            if (-not $deploy) { Write-Host "No $project migration changes in this push - skipping deploy." }
+          }
+          "project=$project" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "key=$($project.ToUpper())" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "deploy=$($deploy.ToString().ToLower())" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+
   flyway-report:
-    name: Generate Report
+    name: Generate Report (${{ needs.detect.outputs.project }})
+    needs: detect
+    if: needs.detect.outputs.deploy == 'true'
     runs-on: self-hosted # Runner to execute the job
+
+    # Per-project settings. For project folder <Name>, create these with the name upper-cased:
+    #   Variables: JDBC_PROD1_<NAME>, JDBC_CHECK_<NAME>
+    #   Optional secrets: DB_USER_PROD1_<NAME>, DB_USER_PW_PROD1_<NAME> (and _CHECK_);
+    #   when absent, the shared DB_USER_PROD1 / DB_USER_PW_PROD1 (etc.) secrets are used.
+    env:
+      PROJECT: ${{ needs.detect.outputs.project }}
+      JDBC_PROD1: ${{ vars[format('JDBC_PROD1_{0}', needs.detect.outputs.key)] }}
+      JDBC_CHECK: ${{ vars[format('JDBC_CHECK_{0}', needs.detect.outputs.key)] }} # Throwaway build DB used by the check report
+      DB_USER_PROD1: ${{ secrets[format('DB_USER_PROD1_{0}', needs.detect.outputs.key)] || secrets.DB_USER_PROD1 }}
+      DB_USER_PW_PROD1: ${{ secrets[format('DB_USER_PW_PROD1_{0}', needs.detect.outputs.key)] || secrets.DB_USER_PW_PROD1 }}
+      DB_USER_CHECK: ${{ secrets[format('DB_USER_CHECK_{0}', needs.detect.outputs.key)] || secrets.DB_USER_CHECK }}
+      DB_USER_PW_CHECK: ${{ secrets[format('DB_USER_PW_CHECK_{0}', needs.detect.outputs.key)] || secrets.DB_USER_PW_CHECK }}
 
     steps: # Steps run strictly in order and stop on the first failure
       - uses: actions/checkout@v5 # Checks out the commit that triggered this run
+
+      - name: Check project settings
+        shell: pwsh
+        run: |
+          $missing = @('JDBC_PROD1','JDBC_CHECK') | Where-Object { -not [Environment]::GetEnvironmentVariable($_) }
+          if ($missing) { throw "Project ${env:PROJECT}: create repository variable(s) $(($missing | ForEach-Object { "${_}_${{ needs.detect.outputs.key }}" }) -join ', ')" }
 
       # NOTE: Windows runners only - not required on Linux runners, where bash is native.
       # Git for Windows' default install puts only Git\cmd on PATH (git.exe, no bash.exe),
@@ -67,7 +119,7 @@ jobs:
       - name: Create Drift and Change Report
         uses: red-gate/flyway-actions/migrations/checks@v2
         with:
-          working-directory: projects/DemoDB
+          working-directory: projects/${{ env.PROJECT }}
           target-url: ${{ env.JDBC_PROD1 }}
           target-user: ${{ env.DB_USER_PROD1 }}
           target-password: ${{ env.DB_USER_PW_PROD1 }}
@@ -76,22 +128,29 @@ jobs:
           build-user: ${{ env.DB_USER_CHECK }}
           build-password: ${{ env.DB_USER_PW_CHECK }}
           build-ok-to-erase: true # Check DB is a throwaway shadow, cleaned each run
-          fail-on-drift: false # Report only - never block the deploy jobs
-          fail-on-code-review: false # Report only - never block the deploy jobs
-          pre-deployment-report-name: flyway-prod-pre-deployment-report
+          fail-on-drift: false # Report only - never block the deploy job
+          fail-on-code-review: false # Report only - never block the deploy job
+          pre-deployment-report-name: flyway-prod-pre-deployment-report-${{ env.PROJECT }}
+          drift-resolution-scripts-name: flyway-checks-prod-drift-resolution-scripts-${{ env.PROJECT }}
 
   # GitHub Actions can support manual approval steps like some other CI/CD tools (e.g., Azure DevOps or GitLab).
   # You can achieve similar functionality using environments with required reviewers or by integrating external approval mechanisms.
   # Alternatively maybe a Review Branch prior to pulling to Production or another downstream environment.
 
-  # Prod 1 and Prod 2 are separate simultaneous jobs; both wait for the report job.
-  # Drift check and snapshot are left at their defaults (enabled) on both deploy jobs.
+  # Waits for the report job.
+  # Drift check and snapshot are left at their defaults (enabled) on the deploy job.
   # Drift is fatal on deploy - an out-of-band hotfix aborts the deployment rather than
   # being silently absorbed into the snapshot baseline.
   flyway-deploy-prod-1:
-    name: Flyway Deploy Production 1
+    name: Flyway Deploy Production 1 (${{ needs.detect.outputs.project }})
     runs-on: self-hosted # Runner to execute the job
-    needs: flyway-report # This job depends on the completion of the flyway-report job
+    needs: [detect, flyway-report] # Runs after the report job
+
+    env:
+      PROJECT: ${{ needs.detect.outputs.project }}
+      JDBC_PROD1: ${{ vars[format('JDBC_PROD1_{0}', needs.detect.outputs.key)] }}
+      DB_USER_PROD1: ${{ secrets[format('DB_USER_PROD1_{0}', needs.detect.outputs.key)] || secrets.DB_USER_PROD1 }}
+      DB_USER_PW_PROD1: ${{ secrets[format('DB_USER_PW_PROD1_{0}', needs.detect.outputs.key)] || secrets.DB_USER_PW_PROD1 }}
 
     steps: # Steps run strictly in order and stop on the first failure
       - uses: actions/checkout@v5 # Checks out the commit that triggered this run
@@ -116,8 +175,9 @@ jobs:
       - name: Deploy Prod 1 # Applies pending migrations
         uses: red-gate/flyway-actions/migrations/deploy@v2
         with:
-          working-directory: projects/DemoDB
+          working-directory: projects/${{ env.PROJECT }}
           target-url: ${{ env.JDBC_PROD1 }}
           target-user: ${{ env.DB_USER_PROD1 }}
           target-password: ${{ env.DB_USER_PW_PROD1 }}
-          deployment-report-name: flyway-prod1-deployment-report
+          deployment-report-name: flyway-prod1-deployment-report-${{ env.PROJECT }}
+          drift-resolution-scripts-name: flyway-deploy-prod1-drift-resolution-scripts-${{ env.PROJECT }}
