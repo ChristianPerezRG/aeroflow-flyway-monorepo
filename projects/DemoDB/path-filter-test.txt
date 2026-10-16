@@ -1,1 +1,0 @@
-Path filter test - this file is outside projects/DemoDB/migrations/ and should not trigger any workflow.
