@@ -1,71 +1,171 @@
 name: Flyway GitHub Actions Build Workflow # Workflow name
-# Uses the Flyway CLI pre-installed on the self-hosted runner.
-# For the equivalent pipeline built on the official Redgate actions
-# (red-gate/setup-flyway + red-gate/flyway-actions), see the flyway-actions folder.
+# Uses the official Redgate actions (red-gate/setup-flyway + red-gate/flyway-actions).
+# No pre-installed Flyway CLI needed - setup-flyway downloads and licenses it per job.
+#
+# MONOREPO: one workflow for every Flyway project under projects/<Name>/.
+# Branches: feature branches -> PR into Development -> PR into Production.
+#   deploy-build.yml  push to Development       migrate + undo on each changed project's Build DB
+#   deploy-qa.yml     pull request to Production drift and change report against Production
+#   deploy-prod.yml   push to Production        deploy each changed project to Production
+#
+# The detect job finds which projects have changed migrations in this push, then the build
+# job runs once per changed project (a matrix). Projects with no changes don't run.
+# Adding a project needs no edits here: each project's database URLs live in its own
+# projects/<Name>/flyway.toml ([environments.build], [environments.check], [environments.production]).
 on:
   push:
     branches:
       - Development
     paths:
-      - "projects/DemoDB/migrations/**"
-# Environment Variables
+      - "projects/*/migrations/**"
+  workflow_dispatch: # Manual run from the Actions tab - builds every project
+
+# Shared settings - the same for every project
 env:
   # Repository Variables - Create these in Settings > Secrets and variables > Actions > Variables
   EMAIL: ${{ vars.USER_EMAIL }} # Email registered to your Flyway license
-  JDBC_BUILD: ${{ vars.JDBC_BUILD }} # e.g. jdbc:sqlserver://<host>;databaseName=<BuildDB>;trustServerCertificate=true
-  JDBC_QA: ${{ vars.JDBC_QA }} # Target of the pre-deployment check report
-  JDBC_CHECK: ${{ vars.JDBC_CHECK }} # Throwaway build DB used by the check report - wiped every run
-
   # Repository Secrets - Create these in Settings > Secrets and variables > Actions > Secrets
   TOKEN: ${{ secrets.FLYWAY_TOKEN }} # Flyway license token (PAT)
-  DB_USER_BUILD: ${{ secrets.DB_USER_BUILD }}
-  DB_USER_PW_BUILD: ${{ secrets.DB_USER_PW_BUILD }}
-  DB_USER_QA: ${{ secrets.DB_USER_QA }}
-  DB_USER_PW_QA: ${{ secrets.DB_USER_PW_QA }}
-  DB_USER_CHECK: ${{ secrets.DB_USER_CHECK }}
-  DB_USER_PW_CHECK: ${{ secrets.DB_USER_PW_CHECK }}
-  FIRST_UNDO_SCRIPT: ${{ secrets.FIRST_UNDO_SCRIPT }} # Validates all undo scripts down to and including this version
 
-# jobs are the steps executed in the workflow
+# Required so the code review results can be uploaded to GitHub Code Scanning
+permissions:
+  contents: read
+  security-events: write
+
 jobs:
-  flyway-build: # Job name
-    runs-on: self-hosted # Runner to execute the job
-    # runs-on: ubuntu-latest
-    defaults:
-      run:
-        shell: cmd # Default shell. Use Windows Command Prompt. bash for linux.
+  # Finds the projects whose migrations changed in this push.
+  # Output: a JSON list such as [{"project":"DemoDB","key":"DEMODB"}] for the matrix below.
+  detect:
+    name: Detect changed projects
+    runs-on: self-hosted
+    outputs:
+      matrix: ${{ steps.detect.outputs.matrix }}
+      any: ${{ steps.detect.outputs.any }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # Full history, so this push can be compared with the previous commit
+
+      - name: Detect changed projects
+        id: detect
+        shell: pwsh
+        run: |
+          $before = '${{ github.event.before }}'
+          $after  = '${{ github.sha }}'
+          $all = @(Get-ChildItem projects -Directory | Where-Object { Test-Path (Join-Path $_.FullName 'migrations') } | ForEach-Object Name)
+          git cat-file -e "$before^{commit}" 2>$null
+          if ($before -match '^0+$' -or $LASTEXITCODE -ne 0) {
+            Write-Host "Manual run or no previous commit to compare with - building every project."
+            $changed = $all
+          } else {
+            $changed = @(foreach ($f in (git diff --name-only $before $after)) {
+              if ($f -match '^projects/([^/]+)/migrations/') { $Matches[1] }
+            }) | Sort-Object -Unique
+          }
+          $items = @(foreach ($p in $changed) {
+            if ($p -notmatch '^[A-Za-z0-9_]+$') { throw "Project folder '$p' must use only letters, digits and underscores." }
+            [ordered]@{ project = $p; key = $p.ToUpper() }
+          })
+          Write-Host "Changed projects: $(@($changed) -join ', ')"
+          "matrix=$(ConvertTo-Json -InputObject $items -Compress)" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "any=$(($items.Count -gt 0).ToString().ToLower())" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+  flyway-build:
+    name: Build ${{ matrix.project }}
+    needs: detect
+    if: needs.detect.outputs.any == 'true'
+    runs-on: self-hosted
+    strategy:
+      fail-fast: false # One project failing doesn't cancel the others
+      matrix:
+        include: ${{ fromJSON(needs.detect.outputs.matrix) }}
+    concurrency:
+      group: flyway-build-${{ matrix.project }} # Never run two builds of the same project at once
+      cancel-in-progress: false
+
+    # Credentials. The shared DB_USER_BUILD / DB_USER_PW_BUILD secrets are used for every
+    # project, unless a project has its own DB_USER_BUILD_<NAME> / DB_USER_PW_BUILD_<NAME>.
+    # Optional variable FIRST_UNDO_SCRIPT_<NAME> overrides the version Rollback Build undoes to.
+    env:
+      PROJECT: ${{ matrix.project }}
+      DB_USER_BUILD: ${{ secrets[format('DB_USER_BUILD_{0}', matrix.key)] || secrets.DB_USER_BUILD }}
+      DB_USER_PW_BUILD: ${{ secrets[format('DB_USER_PW_BUILD_{0}', matrix.key)] || secrets.DB_USER_PW_BUILD }}
+      FIRST_UNDO_OVERRIDE: ${{ vars[format('FIRST_UNDO_SCRIPT_{0}', matrix.key)] }}
+
     steps: # Steps run strictly in order and stop on the first failure
       - name: Checkout Repository # Checks out the commit that triggered this run
         uses: actions/checkout@v5
         with:
           clean: true # Ensure the workspace is cleaned before the workflow runs
 
-      # Runs the Flyway Clean command against the Build database.
-      # -cleanDisabled=false is passed only on this step - clean stays disabled everywhere else.
-      - name: Clean Build DB
-        run: flyway -email="${{ env.EMAIL }}" -token="${{ env.TOKEN }}" clean -cleanDisabled="false" -user="${{ env.DB_USER_BUILD }}" -password="${{ env.DB_USER_PW_BUILD }}" -url="${{ env.JDBC_BUILD }}" -IAgreeToTheEula -locations="filesystem:${{ github.workspace }}/migrations" -configFiles="${{ github.workspace }}/flyway.toml" -baselineOnMigrate=true -errorOverrides=S0001:0:I-
+      # Fails fast if the project's flyway.toml has no Build database URL, and works out the
+      # version Rollback Build undoes back to (the project's first versioned migration).
+      - name: Check project settings
+        id: settings
+        shell: pwsh
+        run: |
+          $toml = Get-Content "projects/$env:PROJECT/flyway.toml" -Raw
+          if ($toml -notmatch '(?ms)^\[environments\.build\][^\[]*?^\s*url\s*=\s*"[^"]+"') {
+            throw "Project ${env:PROJECT}: add [environments.build] with a url to projects/$env:PROJECT/flyway.toml"
+          }
+          $undo = $env:FIRST_UNDO_OVERRIDE
+          if (-not $undo) {
+            $versions = Get-ChildItem "projects/$env:PROJECT/migrations" -Filter 'V*.sql' |
+              ForEach-Object { if ($_.Name -match '^V(.+?)__') { $Matches[1] -replace '_', '.' } }
+            $undo = $versions | Sort-Object { ($_ -split '\.' | ForEach-Object { $_.PadLeft(20, '0') }) -join '.' } | Select-Object -First 1
+          }
+          Write-Host "Project: $env:PROJECT | Rollback Build undoes back to version: $undo"
+          "first_undo=$undo" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
 
-      - name: Migrate Build # Applies all pending migrations from scratch
-        # To use username and password instead of windows integrated security, ensure SQL Server is configured to allow SQL Server authentication. In SSMS check Server Properties > Security and select "SQL Server and Windows Authentication mode".
-        run: flyway -email="${{ env.EMAIL }}" -token="${{ env.TOKEN }}" migrate -user="${{ env.DB_USER_BUILD }}" -password="${{ env.DB_USER_PW_BUILD }}" -url="${{ env.JDBC_BUILD }}" -IAgreeToTheEula -locations="filesystem:${{ github.workspace }}/migrations" -configFiles="${{ github.workspace }}/flyway.toml" -baselineOnMigrate=true -errorOverrides=S0001:0:I-
+      # NOTE: Windows runners only - not required on Linux runners, where bash is native.
+      # Git for Windows' default install puts only Git\cmd on PATH (git.exe, no bash.exe),
+      # so `shell: bash` inside the Flyway actions resolves to WSL's bash, which cannot
+      # read the Windows script path. This puts Git Bash ahead of it.
+      - name: Add Git Bash to PATH
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          "C:\Program Files\Git\bin" | Out-File $env:GITHUB_PATH -Append -Encoding utf8
+          "C:\Program Files\Git\usr\bin" | Out-File $env:GITHUB_PATH -Append -Encoding utf8
 
-      - name: Rollback Build # Validates the undo scripts by rolling back what we just deployed
-        run: flyway -email="${{ env.EMAIL }}" -token="${{ env.TOKEN }}" undo -user="${{ env.DB_USER_BUILD }}" -password="${{ env.DB_USER_PW_BUILD }}" -url="${{ env.JDBC_BUILD }}" -target="${{ env.FIRST_UNDO_SCRIPT }}" -IAgreeToTheEula -locations="filesystem:${{ github.workspace }}/migrations" -configFiles="${{ github.workspace }}/flyway.toml" -baselineOnMigrate=true -errorOverrides=S0001:0:I-
-
-      # Pre-deployment check report against QA, for review during the pull request.
-      # -code    static code analysis      -changes  deployment changes vs build DB
-      # -drift   schema drift vs snapshot  -dryrun   SQL that would run against QA
-      # cleanDisabled is scoped to the throwaway check environment - QA is never clean-enabled.
-      - name: Create QA Check Report
-        run: flyway -email="${{ env.EMAIL }}" -token="${{ env.TOKEN }}" check -code -changes -drift -dryrun -user="${{ env.DB_USER_QA }}" -password="${{ env.DB_USER_PW_QA }}" -url="${{ env.JDBC_QA }}" -environments.check.user="${{ env.DB_USER_CHECK }}" -environments.check.password="${{ env.DB_USER_PW_CHECK }}" -environments.check.url="${{ env.JDBC_CHECK }}" -environments.check.flyway.cleanDisabled=false -check.buildEnvironment="check" -reportFilename="${{ github.workspace }}/reports/QA-Run-${{ github.run_id }}-Check-Report.html" -IAgreeToTheEula -locations="filesystem:${{ github.workspace }}/migrations" -configFiles="${{ github.workspace }}/flyway.toml" -baselineOnMigrate=true -errorOverrides=S0001:0:I-
-
-      # The CLI does not upload reports automatically - publish them as a workflow artifact.
-      # if: always() uploads the report even when the check step fails - that is
-      # when you most need to read it. warn surfaces a missing report.
-      - name: Publish QA Check Report as Artifact
-        if: always()
-        uses: actions/upload-artifact@v5
+      # Installs the Flyway CLI on the runner and adds it to PATH
+      - name: Setup Flyway
+        uses: red-gate/setup-flyway@v3
         with:
-          name: flyway-qa-check-report
-          path: ${{ github.workspace }}/reports/
-          if-no-files-found: warn
+          version: "13.4.0" # Pin for reproducible runs - bump deliberately
+          edition: enterprise
+          i-agree-to-the-eula: true
+          email: ${{ env.EMAIL }}
+          token: ${{ env.TOKEN }}
+
+      # reprovision runs the 'clean' provisioner on the build environment first,
+      # so this cleans and rebuilds the Build DB from scratch in one step.
+      # The URL comes from [environments.build] in the project's flyway.toml.
+      - name: Migrate Build
+        uses: red-gate/flyway-actions/migrations/deploy@v2
+        with:
+          working-directory: projects/${{ matrix.project }}
+          target-environment: build
+          target-user: ${{ env.DB_USER_BUILD }}
+          target-password: ${{ env.DB_USER_PW_BUILD }}
+          provision-mode: reprovision
+          extra-args: -environments.build.flyway.cleanDisabled=false # Allow clean on Build only
+          skip-drift-check: true # Build DB is rebuilt each run, so drift is meaningless
+          skip-snapshot: true
+          deployment-report-name: flyway-build-deployment-report-${{ matrix.project }}
+          drift-resolution-scripts-name: flyway-deploy-build-drift-resolution-scripts-${{ matrix.project }}
+
+      # Validates the undo scripts by rolling back what we just deployed
+      - name: Rollback Build
+        uses: red-gate/flyway-actions/migrations/undo@v2
+        with:
+          working-directory: projects/${{ matrix.project }}
+          target-environment: build
+          target-user: ${{ env.DB_USER_BUILD }}
+          target-password: ${{ env.DB_USER_PW_BUILD }}
+          target-migration-version: ${{ steps.settings.outputs.first_undo }}
+          skip-drift-check: true
+          skip-snapshot: true
+          undo-report-name: flyway-build-undo-report-${{ matrix.project }}
+          drift-resolution-scripts-name: flyway-undo-build-drift-resolution-scripts-${{ matrix.project }}

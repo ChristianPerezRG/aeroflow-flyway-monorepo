@@ -121,10 +121,19 @@ skipIntegrityChecksForForeignKeys = false
 transportClrDataTypesAsBinary = false
 useExistenceChecks = false
 
-[environments.check]
-url = ""
+# Pipeline environments. Credentials are NOT stored here - the workflows pass them
+# from GitHub secrets (DB_USER_<STAGE> / DB_USER_PW_<STAGE>).
+
+# Throwaway database: cleaned and rebuilt by every Build run (deploy-build.yml)
+[environments.build]
+url = "jdbc:sqlserver://localhost:1433;databaseName=SalesDB_Build;trustServerCertificate=true"
 provisioner = "clean"
 
-[environments.build]
-url = ""
+# Throwaway database used to build the change report on the pull request into Production (deploy-qa.yml)
+[environments.check]
+url = "jdbc:sqlserver://localhost:1433;databaseName=SalesDB_Check;trustServerCertificate=true"
 provisioner = "clean"
+
+# Production database: checked on the pull request (deploy-qa.yml), deployed on merge (deploy-prod.yml)
+[environments.production]
+url = "jdbc:sqlserver://localhost:1433;databaseName=SalesDB_Prod1;trustServerCertificate=true"
