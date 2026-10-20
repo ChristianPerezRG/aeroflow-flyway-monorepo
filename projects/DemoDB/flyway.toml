@@ -129,11 +129,11 @@ useExistenceChecks = false
 url = "jdbc:sqlserver://localhost:1433;databaseName=DemoDB_Build;trustServerCertificate=true"
 provisioner = "clean"
 
-# Throwaway database used to build the change report on the pull request into Production (deploy-qa.yml)
+# Throwaway database used to build the Production drift and change report (deploy-qa.yml)
 [environments.check]
 url = "jdbc:sqlserver://localhost:1433;databaseName=DemoDB_Check;trustServerCertificate=true"
 provisioner = "clean"
 
-# Production database: checked on the pull request (deploy-qa.yml), deployed on merge (deploy-prod.yml)
+# Production database: reported on after each Build (deploy-qa.yml), deployed on merge (deploy-prod.yml)
 [environments.production]
 url = "jdbc:sqlserver://localhost:1433;databaseName=DemoDB_Prod1;trustServerCertificate=true"
