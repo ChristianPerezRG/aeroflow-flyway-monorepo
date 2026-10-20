@@ -70,6 +70,7 @@ jobs:
           Write-Host "Changed projects: $(@($changed) -join ', ')"
           "matrix=$(ConvertTo-Json -InputObject $items -Compress)" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
           "any=$(($items.Count -gt 0).ToString().ToLower())" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          exit 0 # git cat-file's exit code above must not fail the step
 
   flyway-build:
     name: Build ${{ matrix.project }}
