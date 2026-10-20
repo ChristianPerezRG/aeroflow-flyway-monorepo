@@ -5,8 +5,8 @@ name: Flyway GitHub Actions Production Workflow # Workflow name
 # MONOREPO: one workflow for every Flyway project under projects/<Name>/.
 # Runs when a pull request is merged into Production. Finds which projects have changed
 # migrations in the merge and deploys each of them (a matrix). Projects with no changes
-# don't run. The drift and change report for review is produced on the pull request
-# itself by deploy-qa.yml.
+# don't run. The drift and change report for review is produced by deploy-qa.yml after
+# each successful Build, before the pull request is opened.
 on:
   push:
     branches:
@@ -53,7 +53,7 @@ jobs:
             if ($f -match '^projects/([^/]+)/migrations/') { $Matches[1] }
           }) | Sort-Object -Unique
           $items = @(foreach ($p in $changed) {
-            if ($p -notmatch '^[A-Za-z0-9_]+$') { throw "Project folder '$p' must use only letters, digits and underscores." }
+            if ($p -notmatch '^[A-Za-z0-9_]+$') { Write-Host "::error::Project folder '$p' must use only letters, digits and underscores."; exit 1 }
             [ordered]@{ project = $p; key = $p.ToUpper() }
           })
           Write-Host "Changed projects: $(@($changed) -join ', ')"
@@ -61,7 +61,7 @@ jobs:
           "any=$(($items.Count -gt 0).ToString().ToLower())" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
 
   # GitHub Actions can add a manual approval before this job using environments with
-  # required reviewers. Here, the review happens on the pull request (deploy-qa.yml report).
+  # required reviewers. Here, the review happens before the pull request (deploy-qa.yml report).
 
   # Drift check and snapshot are left at their defaults (enabled).
   # Drift is fatal on deploy - an out-of-band hotfix made after the pull request was
@@ -79,23 +79,25 @@ jobs:
       group: flyway-deploy-prod-${{ matrix.project }} # Never deploy the same project twice at once
       cancel-in-progress: false
 
-    # Credentials. The shared DB_USER_PROD1 / DB_USER_PW_PROD1 secrets are used for every
-    # project, unless a project has its own DB_USER_PROD1_<NAME> / DB_USER_PW_PROD1_<NAME>.
+    # Credentials. Every project has its own secrets, named with the project folder
+    # name upper-cased: DB_USER_PROD1_<NAME> and DB_USER_PW_PROD1_<NAME>.
     env:
       PROJECT: ${{ matrix.project }}
-      DB_USER_PROD1: ${{ secrets[format('DB_USER_PROD1_{0}', matrix.key)] || secrets.DB_USER_PROD1 }}
-      DB_USER_PW_PROD1: ${{ secrets[format('DB_USER_PW_PROD1_{0}', matrix.key)] || secrets.DB_USER_PW_PROD1 }}
+      DB_USER_PROD1: ${{ secrets[format('DB_USER_PROD1_{0}', matrix.key)] }}
+      DB_USER_PW_PROD1: ${{ secrets[format('DB_USER_PW_PROD1_{0}', matrix.key)] }}
 
     steps: # Steps run strictly in order and stop on the first failure
       - uses: actions/checkout@v5 # Checks out the commit that triggered this run
 
-      # Fails fast if the project's flyway.toml has no Production database URL
+      # Fails fast if the project's secrets or Production database URL are missing
       - name: Check project settings
         shell: pwsh
         run: |
+          $missing = @('DB_USER_PROD1', 'DB_USER_PW_PROD1') | Where-Object { -not [Environment]::GetEnvironmentVariable($_) }
+          if ($missing) { Write-Host "::error::Project ${env:PROJECT}: create repository secret(s) $(($missing | ForEach-Object { "${_}_${{ matrix.key }}" }) -join ', ')"; exit 1 }
           $toml = Get-Content "projects/$env:PROJECT/flyway.toml" -Raw
           if ($toml -notmatch '(?ms)^\[environments\.production\][^\[]*?^\s*url\s*=\s*"[^"]+"') {
-            throw "Project ${env:PROJECT}: add [environments.production] with a url to projects/$env:PROJECT/flyway.toml"
+            Write-Host "::error::Project ${env:PROJECT}: add [environments.production] with a url to projects/$env:PROJECT/flyway.toml"; exit 1
           }
 
       # NOTE: Windows runners only - not required on Linux runners, where bash is native.

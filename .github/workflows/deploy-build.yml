@@ -5,13 +5,17 @@ name: Flyway GitHub Actions Build Workflow # Workflow name
 # MONOREPO: one workflow for every Flyway project under projects/<Name>/.
 # Branches: feature branches -> PR into Development -> PR into Production.
 #   deploy-build.yml  push to Development       migrate + undo on each changed project's Build DB
-#   deploy-qa.yml     pull request to Production drift and change report against Production
+#   deploy-qa.yml     after a successful Build  drift and change report against Production
 #   deploy-prod.yml   push to Production        deploy each changed project to Production
 #
 # The detect job finds which projects have changed migrations in this push, then the build
 # job runs once per changed project (a matrix). Projects with no changes don't run.
-# Adding a project needs no edits here: each project's database URLs live in its own
-# projects/<Name>/flyway.toml ([environments.build], [environments.check], [environments.production]).
+# Adding a project needs no edits to these workflow files:
+#   1. Database URLs go in its projects/<Name>/flyway.toml
+#      ([environments.build], [environments.check], [environments.production]).
+#   2. Six repository secrets, with the folder name upper-cased as <NAME>:
+#      DB_USER_BUILD_<NAME>, DB_USER_PW_BUILD_<NAME>, DB_USER_CHECK_<NAME>,
+#      DB_USER_PW_CHECK_<NAME>, DB_USER_PROD1_<NAME>, DB_USER_PW_PROD1_<NAME>.
 on:
   push:
     branches:
@@ -64,7 +68,7 @@ jobs:
             }) | Sort-Object -Unique
           }
           $items = @(foreach ($p in $changed) {
-            if ($p -notmatch '^[A-Za-z0-9_]+$') { throw "Project folder '$p' must use only letters, digits and underscores." }
+            if ($p -notmatch '^[A-Za-z0-9_]+$') { Write-Host "::error::Project folder '$p' must use only letters, digits and underscores."; exit 1 }
             [ordered]@{ project = $p; key = $p.ToUpper() }
           })
           Write-Host "Changed projects: $(@($changed) -join ', ')"
@@ -85,13 +89,13 @@ jobs:
       group: flyway-build-${{ matrix.project }} # Never run two builds of the same project at once
       cancel-in-progress: false
 
-    # Credentials. The shared DB_USER_BUILD / DB_USER_PW_BUILD secrets are used for every
-    # project, unless a project has its own DB_USER_BUILD_<NAME> / DB_USER_PW_BUILD_<NAME>.
+    # Credentials. Every project has its own secrets, named with the project folder
+    # name upper-cased: DB_USER_BUILD_<NAME> and DB_USER_PW_BUILD_<NAME>.
     # Optional variable FIRST_UNDO_SCRIPT_<NAME> overrides the version Rollback Build undoes to.
     env:
       PROJECT: ${{ matrix.project }}
-      DB_USER_BUILD: ${{ secrets[format('DB_USER_BUILD_{0}', matrix.key)] || secrets.DB_USER_BUILD }}
-      DB_USER_PW_BUILD: ${{ secrets[format('DB_USER_PW_BUILD_{0}', matrix.key)] || secrets.DB_USER_PW_BUILD }}
+      DB_USER_BUILD: ${{ secrets[format('DB_USER_BUILD_{0}', matrix.key)] }}
+      DB_USER_PW_BUILD: ${{ secrets[format('DB_USER_PW_BUILD_{0}', matrix.key)] }}
       FIRST_UNDO_OVERRIDE: ${{ vars[format('FIRST_UNDO_SCRIPT_{0}', matrix.key)] }}
 
     steps: # Steps run strictly in order and stop on the first failure
@@ -100,15 +104,17 @@ jobs:
         with:
           clean: true # Ensure the workspace is cleaned before the workflow runs
 
-      # Fails fast if the project's flyway.toml has no Build database URL, and works out the
-      # version Rollback Build undoes back to (the project's first versioned migration).
+      # Fails fast if the project's secrets or Build database URL are missing, and works out
+      # the version Rollback Build undoes back to (the project's first versioned migration).
       - name: Check project settings
         id: settings
         shell: pwsh
         run: |
+          $missing = @('DB_USER_BUILD', 'DB_USER_PW_BUILD') | Where-Object { -not [Environment]::GetEnvironmentVariable($_) }
+          if ($missing) { Write-Host "::error::Project ${env:PROJECT}: create repository secret(s) $(($missing | ForEach-Object { "${_}_${{ matrix.key }}" }) -join ', ')"; exit 1 }
           $toml = Get-Content "projects/$env:PROJECT/flyway.toml" -Raw
           if ($toml -notmatch '(?ms)^\[environments\.build\][^\[]*?^\s*url\s*=\s*"[^"]+"') {
-            throw "Project ${env:PROJECT}: add [environments.build] with a url to projects/$env:PROJECT/flyway.toml"
+            Write-Host "::error::Project ${env:PROJECT}: add [environments.build] with a url to projects/$env:PROJECT/flyway.toml"; exit 1
           }
           $undo = $env:FIRST_UNDO_OVERRIDE
           if (-not $undo) {
