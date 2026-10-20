@@ -1,32 +1,101 @@
-name: Flyway GitHub Actions QA Workflow
+name: Flyway GitHub Actions QA Workflow # Workflow name
 # Uses the official Redgate actions (red-gate/setup-flyway + red-gate/flyway-actions).
 # No pre-installed Flyway CLI needed - setup-flyway downloads and licenses it per job.
-# For the equivalent pipeline calling a pre-installed Flyway CLI, see the flyway-cli folder.
+#
+# MONOREPO: one workflow for every Flyway project under projects/<Name>/.
+# This is the quality gate on the pull request from Development into Production.
+# It finds which projects the pull request changes, and for each one produces a drift and
+# change report against that project's Production database, before anything is merged.
+# Nothing is deployed here - deploy-prod.yml deploys when the pull request is merged.
+# Reports are on the run's Summary page (Checks tab of the pull request > Details).
 on:
-  push:
+  pull_request:
     branches:
-      - QA
+      - Production
     paths:
-      - "projects/DemoDB/migrations/**"
+      - "projects/*/migrations/**"
 
-# Environment Variables
+# Shared settings - the same for every project
 env:
   # Repository Variables - Create these in Settings > Secrets and variables > Actions > Variables
   EMAIL: ${{ vars.USER_EMAIL }} # Email registered to your Flyway license
-  JDBC_QA: ${{ vars.JDBC_QA }} # e.g. jdbc:sqlserver://<host>;databaseName=<QADB>;trustServerCertificate=true
-
   # Repository Secrets - Create these in Settings > Secrets and variables > Actions > Secrets
   TOKEN: ${{ secrets.FLYWAY_TOKEN }} # Flyway license token (PAT)
-  DB_USER_QA: ${{ secrets.DB_USER_QA }}
-  DB_USER_PW_QA: ${{ secrets.DB_USER_PW_QA }}
+
+# Required so the code review results can be uploaded to GitHub Code Scanning
+permissions:
+  contents: read
+  security-events: write
 
 jobs:
-  flyway-deploy-qa:
+  # Finds the projects whose migrations this pull request changes - exactly the projects
+  # deploy-prod.yml will deploy when it is merged.
+  # Output: a JSON list such as [{"project":"DemoDB","key":"DEMODB"}] for the matrix below.
+  detect:
+    name: Detect changed projects
+    runs-on: self-hosted
+    outputs:
+      matrix: ${{ steps.detect.outputs.matrix }}
+      any: ${{ steps.detect.outputs.any }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # Full history, so the pull request can be compared with Production
+
+      - name: Detect changed projects
+        id: detect
+        shell: pwsh
+        run: |
+          # Three dots: changes on the pull request branch since it split from Production
+          $files = git diff --name-only '${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}'
+          if ($LASTEXITCODE -ne 0) { throw "Could not compare the pull request with Production." }
+          $changed = @(foreach ($f in $files) {
+            if ($f -match '^projects/([^/]+)/migrations/') { $Matches[1] }
+          }) | Sort-Object -Unique
+          $items = @(foreach ($p in $changed) {
+            if ($p -notmatch '^[A-Za-z0-9_]+$') { throw "Project folder '$p' must use only letters, digits and underscores." }
+            [ordered]@{ project = $p; key = $p.ToUpper() }
+          })
+          Write-Host "Projects in this pull request: $(@($changed) -join ', ')"
+          "matrix=$(ConvertTo-Json -InputObject $items -Compress)" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "any=$(($items.Count -gt 0).ToString().ToLower())" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+  flyway-check-prod:
+    name: Check ${{ matrix.project }} against Production
+    needs: detect
+    if: needs.detect.outputs.any == 'true'
     runs-on: self-hosted # Runner to execute the job
-    # runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false # One project failing doesn't cancel the others
+      matrix:
+        include: ${{ fromJSON(needs.detect.outputs.matrix) }}
+    concurrency:
+      group: flyway-check-${{ matrix.project }} # The Check DB is shared per project - one run at a time
+      cancel-in-progress: false
+
+    # Credentials. The shared DB_USER_PROD1 / DB_USER_CHECK secrets (and passwords) are used
+    # for every project, unless a project has its own <SECRET>_<NAME>, e.g. DB_USER_PROD1_SALESDB.
+    env:
+      PROJECT: ${{ matrix.project }}
+      DB_USER_PROD1: ${{ secrets[format('DB_USER_PROD1_{0}', matrix.key)] || secrets.DB_USER_PROD1 }}
+      DB_USER_PW_PROD1: ${{ secrets[format('DB_USER_PW_PROD1_{0}', matrix.key)] || secrets.DB_USER_PW_PROD1 }}
+      DB_USER_CHECK: ${{ secrets[format('DB_USER_CHECK_{0}', matrix.key)] || secrets.DB_USER_CHECK }}
+      DB_USER_PW_CHECK: ${{ secrets[format('DB_USER_PW_CHECK_{0}', matrix.key)] || secrets.DB_USER_PW_CHECK }}
 
     steps: # Steps run strictly in order and stop on the first failure
-      - uses: actions/checkout@v5 # Checks out the commit that triggered this run
+      - uses: actions/checkout@v5 # Checks out the pull request as it would look once merged
+
+      # Fails fast if the project's flyway.toml is missing a database URL this job needs
+      - name: Check project settings
+        shell: pwsh
+        run: |
+          $toml = Get-Content "projects/$env:PROJECT/flyway.toml" -Raw
+          foreach ($e in 'production', 'check') {
+            if ($toml -notmatch "(?ms)^\[environments\.$e\][^\[]*?^\s*url\s*=\s*`"[^`"]+`"") {
+              throw "Project ${env:PROJECT}: add [environments.$e] with a url to projects/$env:PROJECT/flyway.toml"
+            }
+          }
 
       # NOTE: Windows runners only - not required on Linux runners, where bash is native.
       # Git for Windows' default install puts only Git\cmd on PATH (git.exe, no bash.exe),
@@ -49,13 +118,21 @@ jobs:
           email: ${{ env.EMAIL }}
           token: ${{ env.TOKEN }}
 
-      # Drift check and snapshot are left at their defaults (enabled), so each QA
-      # deployment stores a snapshot - this is what makes drift detection meaningful.
-      - name: Deploy to QA
-        uses: red-gate/flyway-actions/migrations/deploy@v2
+      # Code analysis, changes, drift and dry run all run by default - no flags needed.
+      # URLs come from [environments.production] and [environments.check] in flyway.toml.
+      # The report is uploaded as a workflow artifact automatically.
+      - name: Create Drift and Change Report
+        uses: red-gate/flyway-actions/migrations/checks@v2
         with:
-          working-directory: projects/DemoDB
-          target-url: ${{ env.JDBC_QA }}
-          target-user: ${{ env.DB_USER_QA }}
-          target-password: ${{ env.DB_USER_PW_QA }}
-          deployment-report-name: flyway-qa-deployment-report
+          working-directory: projects/${{ matrix.project }}
+          target-environment: production
+          target-user: ${{ env.DB_USER_PROD1 }}
+          target-password: ${{ env.DB_USER_PW_PROD1 }}
+          build-environment: check
+          build-user: ${{ env.DB_USER_CHECK }}
+          build-password: ${{ env.DB_USER_PW_CHECK }}
+          build-ok-to-erase: true # Check DB is a throwaway shadow, cleaned each run
+          fail-on-drift: false # Report only - set to true to block the merge when Production has drifted
+          fail-on-code-review: false # Report only - set to true to block the merge on code review violations
+          pre-deployment-report-name: flyway-prod-pre-deployment-report-${{ matrix.project }}
+          drift-resolution-scripts-name: flyway-checks-prod-drift-resolution-scripts-${{ matrix.project }}

@@ -1,45 +1,102 @@
 name: Flyway GitHub Actions Production Workflow # Workflow name
 # Uses the official Redgate actions (red-gate/setup-flyway + red-gate/flyway-actions).
 # No pre-installed Flyway CLI needed - setup-flyway downloads and licenses it per job.
-# For the equivalent pipeline calling a pre-installed Flyway CLI, see the flyway-cli folder.
+#
+# MONOREPO: one workflow for every Flyway project under projects/<Name>/.
+# Runs when a pull request is merged into Production. Finds which projects have changed
+# migrations in the merge and deploys each of them (a matrix). Projects with no changes
+# don't run. The drift and change report for review is produced on the pull request
+# itself by deploy-qa.yml.
 on:
   push:
     branches:
       - Production
     paths:
-      - "projects/DemoDB/migrations/**"
+      - "projects/*/migrations/**"
 
-# Environment Variables
+# Shared settings - the same for every project
 env:
   # Repository Variables - Create these in Settings > Secrets and variables > Actions > Variables
   EMAIL: ${{ vars.USER_EMAIL }} # Email registered to your Flyway license
-  JDBC_PROD1: ${{ vars.JDBC_PROD1 }} # e.g. jdbc:sqlserver://<host>;databaseName=<Prod1DB>;trustServerCertificate=true
-  JDBC_PROD2: ${{ vars.JDBC_PROD2 }}
-  JDBC_CHECK: ${{ vars.JDBC_CHECK }} # Throwaway build DB used by the check report - wiped every run
-
   # Repository Secrets - Create these in Settings > Secrets and variables > Actions > Secrets
   TOKEN: ${{ secrets.FLYWAY_TOKEN }} # Flyway license token (PAT)
-  DB_USER_CHECK: ${{ secrets.DB_USER_CHECK }}
-  DB_USER_PW_CHECK: ${{ secrets.DB_USER_PW_CHECK }}
-  DB_USER_PROD1: ${{ secrets.DB_USER_PROD1 }}
-  DB_USER_PW_PROD1: ${{ secrets.DB_USER_PW_PROD1 }}
-  DB_USER_PROD2: ${{ secrets.DB_USER_PROD2 }}
-  DB_USER_PW_PROD2: ${{ secrets.DB_USER_PW_PROD2 }}
-  # End of Environment Secrets #
 
-# Required so the code review results can be uploaded to GitHub Code Scanning
 permissions:
   contents: read
-  security-events: write
 
-# jobs are the steps executed in the workflow
 jobs:
-  flyway-report:
-    name: Generate Report
+  # Finds the projects whose migrations changed in this push (the merged pull request).
+  # Output: a JSON list such as [{"project":"DemoDB","key":"DEMODB"}] for the matrix below.
+  detect:
+    name: Detect changed projects
+    runs-on: self-hosted
+    outputs:
+      matrix: ${{ steps.detect.outputs.matrix }}
+      any: ${{ steps.detect.outputs.any }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # Full history, so this push can be compared with the previous commit
+
+      - name: Detect changed projects
+        id: detect
+        shell: pwsh
+        run: |
+          $before = '${{ github.event.before }}'
+          git cat-file -e "$before^{commit}" 2>$null
+          if ($before -match '^0+$' -or $LASTEXITCODE -ne 0) {
+            # Never deploy everything by accident on a new branch or a force push
+            throw "Cannot find the previous Production commit ($before) to compare with. Promote with a pull request rather than a force push."
+          }
+          $changed = @(foreach ($f in (git diff --name-only $before '${{ github.sha }}')) {
+            if ($f -match '^projects/([^/]+)/migrations/') { $Matches[1] }
+          }) | Sort-Object -Unique
+          $items = @(foreach ($p in $changed) {
+            if ($p -notmatch '^[A-Za-z0-9_]+$') { throw "Project folder '$p' must use only letters, digits and underscores." }
+            [ordered]@{ project = $p; key = $p.ToUpper() }
+          })
+          Write-Host "Changed projects: $(@($changed) -join ', ')"
+          "matrix=$(ConvertTo-Json -InputObject $items -Compress)" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "any=$(($items.Count -gt 0).ToString().ToLower())" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+  # GitHub Actions can add a manual approval before this job using environments with
+  # required reviewers. Here, the review happens on the pull request (deploy-qa.yml report).
+
+  # Drift check and snapshot are left at their defaults (enabled).
+  # Drift is fatal on deploy - an out-of-band hotfix made after the pull request was
+  # checked aborts the deployment rather than being silently absorbed into the snapshot.
+  flyway-deploy-prod:
+    name: Deploy ${{ matrix.project }} to Production
+    needs: detect
+    if: needs.detect.outputs.any == 'true'
     runs-on: self-hosted # Runner to execute the job
+    strategy:
+      fail-fast: false # One project failing doesn't cancel the others
+      matrix:
+        include: ${{ fromJSON(needs.detect.outputs.matrix) }}
+    concurrency:
+      group: flyway-deploy-prod-${{ matrix.project }} # Never deploy the same project twice at once
+      cancel-in-progress: false
+
+    # Credentials. The shared DB_USER_PROD1 / DB_USER_PW_PROD1 secrets are used for every
+    # project, unless a project has its own DB_USER_PROD1_<NAME> / DB_USER_PW_PROD1_<NAME>.
+    env:
+      PROJECT: ${{ matrix.project }}
+      DB_USER_PROD1: ${{ secrets[format('DB_USER_PROD1_{0}', matrix.key)] || secrets.DB_USER_PROD1 }}
+      DB_USER_PW_PROD1: ${{ secrets[format('DB_USER_PW_PROD1_{0}', matrix.key)] || secrets.DB_USER_PW_PROD1 }}
 
     steps: # Steps run strictly in order and stop on the first failure
       - uses: actions/checkout@v5 # Checks out the commit that triggered this run
+
+      # Fails fast if the project's flyway.toml has no Production database URL
+      - name: Check project settings
+        shell: pwsh
+        run: |
+          $toml = Get-Content "projects/$env:PROJECT/flyway.toml" -Raw
+          if ($toml -notmatch '(?ms)^\[environments\.production\][^\[]*?^\s*url\s*=\s*"[^"]+"') {
+            throw "Project ${env:PROJECT}: add [environments.production] with a url to projects/$env:PROJECT/flyway.toml"
+          }
 
       # NOTE: Windows runners only - not required on Linux runners, where bash is native.
       # Git for Windows' default install puts only Git\cmd on PATH (git.exe, no bash.exe),
@@ -52,7 +109,6 @@ jobs:
           "C:\Program Files\Git\bin" | Out-File $env:GITHUB_PATH -Append -Encoding utf8
           "C:\Program Files\Git\usr\bin" | Out-File $env:GITHUB_PATH -Append -Encoding utf8
 
-      # Installs the Flyway CLI on the runner and adds it to PATH
       - name: Setup Flyway
         uses: red-gate/setup-flyway@v3
         with:
@@ -62,62 +118,13 @@ jobs:
           email: ${{ env.EMAIL }}
           token: ${{ env.TOKEN }}
 
-      # Code analysis, changes, drift and dry run all run by default - no flags needed.
-      # The report is uploaded as a workflow artifact automatically.
-      - name: Create Drift and Change Report
-        uses: red-gate/flyway-actions/migrations/checks@v2
-        with:
-          working-directory: projects/DemoDB
-          target-url: ${{ env.JDBC_PROD1 }}
-          target-user: ${{ env.DB_USER_PROD1 }}
-          target-password: ${{ env.DB_USER_PW_PROD1 }}
-          build-environment: check
-          build-url: ${{ env.JDBC_CHECK }}
-          build-user: ${{ env.DB_USER_CHECK }}
-          build-password: ${{ env.DB_USER_PW_CHECK }}
-          build-ok-to-erase: true # Check DB is a throwaway shadow, cleaned each run
-          fail-on-drift: false # Report only - never block the deploy jobs
-          fail-on-code-review: false # Report only - never block the deploy jobs
-          pre-deployment-report-name: flyway-prod-pre-deployment-report
-
-  # GitHub Actions can support manual approval steps like some other CI/CD tools (e.g., Azure DevOps or GitLab).
-  # You can achieve similar functionality using environments with required reviewers or by integrating external approval mechanisms.
-  # Alternatively maybe a Review Branch prior to pulling to Production or another downstream environment.
-
-  # Prod 1 and Prod 2 are separate simultaneous jobs; both wait for the report job.
-  # Drift check and snapshot are left at their defaults (enabled) on both deploy jobs.
-  # Drift is fatal on deploy - an out-of-band hotfix aborts the deployment rather than
-  # being silently absorbed into the snapshot baseline.
-  flyway-deploy-prod-1:
-    name: Flyway Deploy Production 1
-    runs-on: self-hosted # Runner to execute the job
-    needs: flyway-report # This job depends on the completion of the flyway-report job
-
-    steps: # Steps run strictly in order and stop on the first failure
-      - uses: actions/checkout@v5 # Checks out the commit that triggered this run
-
-      # NOTE: Windows runners only - see comment in the flyway-report job above.
-      - name: Add Git Bash to PATH
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          "C:\Program Files\Git\bin" | Out-File $env:GITHUB_PATH -Append -Encoding utf8
-          "C:\Program Files\Git\usr\bin" | Out-File $env:GITHUB_PATH -Append -Encoding utf8
-
-      - name: Setup Flyway
-        uses: red-gate/setup-flyway@v3
-        with:
-          version: "13.4.0" # Pin for reproducible runs - bump deliberately
-          edition: enterprise
-          i-agree-to-the-eula: true
-          email: ${{ env.EMAIL }}
-          token: ${{ env.TOKEN }}
-
-      - name: Deploy Prod 1 # Applies pending migrations
+      # Applies pending migrations. The URL comes from [environments.production] in flyway.toml.
+      - name: Deploy to Production
         uses: red-gate/flyway-actions/migrations/deploy@v2
         with:
-          working-directory: projects/DemoDB
-          target-url: ${{ env.JDBC_PROD1 }}
+          working-directory: projects/${{ matrix.project }}
+          target-environment: production
           target-user: ${{ env.DB_USER_PROD1 }}
           target-password: ${{ env.DB_USER_PW_PROD1 }}
-          deployment-report-name: flyway-prod1-deployment-report
+          deployment-report-name: flyway-prod-deployment-report-${{ matrix.project }}
+          drift-resolution-scripts-name: flyway-deploy-prod-drift-resolution-scripts-${{ matrix.project }}
