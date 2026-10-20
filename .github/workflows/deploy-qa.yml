@@ -54,7 +54,7 @@ jobs:
             if ($f -match '^projects/([^/]+)/migrations/') { $Matches[1] }
           }) | Sort-Object -Unique
           $items = @(foreach ($p in $changed) {
-            if ($p -notmatch '^[A-Za-z0-9_]+$') { throw "Project folder '$p' must use only letters, digits and underscores." }
+            if ($p -notmatch '^[A-Za-z0-9_]+$') { Write-Host "::error::Project folder '$p' must use only letters, digits and underscores."; exit 1 }
             [ordered]@{ project = $p; key = $p.ToUpper() }
           })
           Write-Host "Projects in this pull request: $(@($changed) -join ', ')"
@@ -92,11 +92,11 @@ jobs:
         shell: pwsh
         run: |
           $missing = @('DB_USER_PROD1', 'DB_USER_PW_PROD1', 'DB_USER_CHECK', 'DB_USER_PW_CHECK') | Where-Object { -not [Environment]::GetEnvironmentVariable($_) }
-          if ($missing) { throw "Project ${env:PROJECT}: create repository secret(s) $(($missing | ForEach-Object { "${_}_${{ matrix.key }}" }) -join ', ')" }
+          if ($missing) { Write-Host "::error::Project ${env:PROJECT}: create repository secret(s) $(($missing | ForEach-Object { "${_}_${{ matrix.key }}" }) -join ', ')"; exit 1 }
           $toml = Get-Content "projects/$env:PROJECT/flyway.toml" -Raw
           foreach ($e in 'production', 'check') {
             if ($toml -notmatch "(?ms)^\[environments\.$e\][^\[]*?^\s*url\s*=\s*`"[^`"]+`"") {
-              throw "Project ${env:PROJECT}: add [environments.$e] with a url to projects/$env:PROJECT/flyway.toml"
+              Write-Host "::error::Project ${env:PROJECT}: add [environments.$e] with a url to projects/$env:PROJECT/flyway.toml"; exit 1
             }
           }
 

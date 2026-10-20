@@ -68,7 +68,7 @@ jobs:
             }) | Sort-Object -Unique
           }
           $items = @(foreach ($p in $changed) {
-            if ($p -notmatch '^[A-Za-z0-9_]+$') { throw "Project folder '$p' must use only letters, digits and underscores." }
+            if ($p -notmatch '^[A-Za-z0-9_]+$') { Write-Host "::error::Project folder '$p' must use only letters, digits and underscores."; exit 1 }
             [ordered]@{ project = $p; key = $p.ToUpper() }
           })
           Write-Host "Changed projects: $(@($changed) -join ', ')"
@@ -111,10 +111,10 @@ jobs:
         shell: pwsh
         run: |
           $missing = @('DB_USER_BUILD', 'DB_USER_PW_BUILD') | Where-Object { -not [Environment]::GetEnvironmentVariable($_) }
-          if ($missing) { throw "Project ${env:PROJECT}: create repository secret(s) $(($missing | ForEach-Object { "${_}_${{ matrix.key }}" }) -join ', ')" }
+          if ($missing) { Write-Host "::error::Project ${env:PROJECT}: create repository secret(s) $(($missing | ForEach-Object { "${_}_${{ matrix.key }}" }) -join ', ')"; exit 1 }
           $toml = Get-Content "projects/$env:PROJECT/flyway.toml" -Raw
           if ($toml -notmatch '(?ms)^\[environments\.build\][^\[]*?^\s*url\s*=\s*"[^"]+"') {
-            throw "Project ${env:PROJECT}: add [environments.build] with a url to projects/$env:PROJECT/flyway.toml"
+            Write-Host "::error::Project ${env:PROJECT}: add [environments.build] with a url to projects/$env:PROJECT/flyway.toml"; exit 1
           }
           $undo = $env:FIRST_UNDO_OVERRIDE
           if (-not $undo) {
