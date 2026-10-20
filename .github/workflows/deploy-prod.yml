@@ -79,20 +79,22 @@ jobs:
       group: flyway-deploy-prod-${{ matrix.project }} # Never deploy the same project twice at once
       cancel-in-progress: false
 
-    # Credentials. The shared DB_USER_PROD1 / DB_USER_PW_PROD1 secrets are used for every
-    # project, unless a project has its own DB_USER_PROD1_<NAME> / DB_USER_PW_PROD1_<NAME>.
+    # Credentials. Every project has its own secrets, named with the project folder
+    # name upper-cased: DB_USER_PROD1_<NAME> and DB_USER_PW_PROD1_<NAME>.
     env:
       PROJECT: ${{ matrix.project }}
-      DB_USER_PROD1: ${{ secrets[format('DB_USER_PROD1_{0}', matrix.key)] || secrets.DB_USER_PROD1 }}
-      DB_USER_PW_PROD1: ${{ secrets[format('DB_USER_PW_PROD1_{0}', matrix.key)] || secrets.DB_USER_PW_PROD1 }}
+      DB_USER_PROD1: ${{ secrets[format('DB_USER_PROD1_{0}', matrix.key)] }}
+      DB_USER_PW_PROD1: ${{ secrets[format('DB_USER_PW_PROD1_{0}', matrix.key)] }}
 
     steps: # Steps run strictly in order and stop on the first failure
       - uses: actions/checkout@v5 # Checks out the commit that triggered this run
 
-      # Fails fast if the project's flyway.toml has no Production database URL
+      # Fails fast if the project's secrets or Production database URL are missing
       - name: Check project settings
         shell: pwsh
         run: |
+          $missing = @('DB_USER_PROD1', 'DB_USER_PW_PROD1') | Where-Object { -not [Environment]::GetEnvironmentVariable($_) }
+          if ($missing) { throw "Project ${env:PROJECT}: create repository secret(s) $(($missing | ForEach-Object { "${_}_${{ matrix.key }}" }) -join ', ')" }
           $toml = Get-Content "projects/$env:PROJECT/flyway.toml" -Raw
           if ($toml -notmatch '(?ms)^\[environments\.production\][^\[]*?^\s*url\s*=\s*"[^"]+"') {
             throw "Project ${env:PROJECT}: add [environments.production] with a url to projects/$env:PROJECT/flyway.toml"

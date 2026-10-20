@@ -74,22 +74,25 @@ jobs:
       group: flyway-check-${{ matrix.project }} # The Check DB is shared per project - one run at a time
       cancel-in-progress: false
 
-    # Credentials. The shared DB_USER_PROD1 / DB_USER_CHECK secrets (and passwords) are used
-    # for every project, unless a project has its own <SECRET>_<NAME>, e.g. DB_USER_PROD1_SALESDB.
+    # Credentials. Every project has its own secrets, named with the project folder
+    # name upper-cased: DB_USER_PROD1_<NAME>, DB_USER_PW_PROD1_<NAME>,
+    # DB_USER_CHECK_<NAME> and DB_USER_PW_CHECK_<NAME>.
     env:
       PROJECT: ${{ matrix.project }}
-      DB_USER_PROD1: ${{ secrets[format('DB_USER_PROD1_{0}', matrix.key)] || secrets.DB_USER_PROD1 }}
-      DB_USER_PW_PROD1: ${{ secrets[format('DB_USER_PW_PROD1_{0}', matrix.key)] || secrets.DB_USER_PW_PROD1 }}
-      DB_USER_CHECK: ${{ secrets[format('DB_USER_CHECK_{0}', matrix.key)] || secrets.DB_USER_CHECK }}
-      DB_USER_PW_CHECK: ${{ secrets[format('DB_USER_PW_CHECK_{0}', matrix.key)] || secrets.DB_USER_PW_CHECK }}
+      DB_USER_PROD1: ${{ secrets[format('DB_USER_PROD1_{0}', matrix.key)] }}
+      DB_USER_PW_PROD1: ${{ secrets[format('DB_USER_PW_PROD1_{0}', matrix.key)] }}
+      DB_USER_CHECK: ${{ secrets[format('DB_USER_CHECK_{0}', matrix.key)] }}
+      DB_USER_PW_CHECK: ${{ secrets[format('DB_USER_PW_CHECK_{0}', matrix.key)] }}
 
     steps: # Steps run strictly in order and stop on the first failure
       - uses: actions/checkout@v5 # Checks out the pull request as it would look once merged
 
-      # Fails fast if the project's flyway.toml is missing a database URL this job needs
+      # Fails fast if the project's secrets or a database URL this job needs are missing
       - name: Check project settings
         shell: pwsh
         run: |
+          $missing = @('DB_USER_PROD1', 'DB_USER_PW_PROD1', 'DB_USER_CHECK', 'DB_USER_PW_CHECK') | Where-Object { -not [Environment]::GetEnvironmentVariable($_) }
+          if ($missing) { throw "Project ${env:PROJECT}: create repository secret(s) $(($missing | ForEach-Object { "${_}_${{ matrix.key }}" }) -join ', ')" }
           $toml = Get-Content "projects/$env:PROJECT/flyway.toml" -Raw
           foreach ($e in 'production', 'check') {
             if ($toml -notmatch "(?ms)^\[environments\.$e\][^\[]*?^\s*url\s*=\s*`"[^`"]+`"") {
