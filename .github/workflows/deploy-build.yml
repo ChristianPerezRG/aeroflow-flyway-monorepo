@@ -5,7 +5,7 @@ name: Flyway GitHub Actions Build Workflow # Workflow name
 # MONOREPO: one workflow for every Flyway project under projects/<Name>/.
 # Branches: feature branches -> PR into Development -> PR into Production.
 #   deploy-build.yml  push to Development       migrate + undo on each changed project's Build DB
-#   deploy-qa.yml     pull request to Production drift and change report against Production
+#   deploy-qa.yml     after a successful Build  drift and change report against Production
 #   deploy-prod.yml   push to Production        deploy each changed project to Production
 #
 # The detect job finds which projects have changed migrations in this push, then the build

@@ -3,17 +3,20 @@ name: Flyway GitHub Actions QA Workflow # Workflow name
 # No pre-installed Flyway CLI needed - setup-flyway downloads and licenses it per job.
 #
 # MONOREPO: one workflow for every Flyway project under projects/<Name>/.
-# This is the quality gate on the pull request from Development into Production.
-# It finds which projects the pull request changes, and for each one produces a drift and
-# change report against that project's Production database, before anything is merged.
+# Runs automatically when the Build workflow succeeds on Development. For every project
+# with migrations on Development that aren't on Production yet - exactly what a pull request
+# into Production would carry - it produces a drift and change report against that
+# project's Production database. Review the reports, then open the pull request.
 # Nothing is deployed here - deploy-prod.yml deploys when the pull request is merged.
-# Reports are on the run's Summary page (Checks tab of the pull request > Details).
+# Reports are on this workflow's run in the Actions tab (run > Summary > Artifacts).
+# Note: GitHub only starts workflow_run workflows from the default branch (Development).
+run-name: Production report after ${{ github.event.workflow_run.display_title }}
 on:
-  pull_request:
-    branches:
-      - Production
-    paths:
-      - "projects/*/migrations/**"
+  workflow_run:
+    workflows:
+      - Flyway GitHub Actions Build Workflow # Must match the name: line in deploy-build.yml
+    types:
+      - completed
 
 # Shared settings - the same for every project
 env:
@@ -28,11 +31,13 @@ permissions:
   security-events: write
 
 jobs:
-  # Finds the projects whose migrations this pull request changes - exactly the projects
-  # deploy-prod.yml will deploy when it is merged.
+  # Finds the projects with migrations on Development that aren't on Production yet,
+  # using the exact commit the Build run tested.
   # Output: a JSON list such as [{"project":"DemoDB","key":"DEMODB"}] for the matrix below.
   detect:
-    name: Detect changed projects
+    name: Detect projects to promote
+    # Only after a successful Build of the Development branch
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'Development'
     runs-on: self-hosted
     outputs:
       matrix: ${{ steps.detect.outputs.matrix }}
@@ -41,15 +46,18 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v5
         with:
-          fetch-depth: 0 # Full history, so the pull request can be compared with Production
+          ref: ${{ github.event.workflow_run.head_sha }} # The commit the Build run tested
+          fetch-depth: 0 # Full history, so Development can be compared with Production
 
-      - name: Detect changed projects
+      - name: Detect projects to promote
         id: detect
         shell: pwsh
         run: |
-          # Three dots: changes on the pull request branch since it split from Production
-          $files = git diff --name-only '${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}'
-          if ($LASTEXITCODE -ne 0) { throw "Could not compare the pull request with Production." }
+          git rev-parse --verify --quiet origin/Production *> $null
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::No Production branch found to compare with."; exit 1 }
+          # Three dots: changes on Development since it split from Production
+          $files = git diff --name-only 'origin/Production...${{ github.event.workflow_run.head_sha }}'
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::Could not compare Development with Production."; exit 1 }
           $changed = @(foreach ($f in $files) {
             if ($f -match '^projects/([^/]+)/migrations/') { $Matches[1] }
           }) | Sort-Object -Unique
@@ -57,7 +65,7 @@ jobs:
             if ($p -notmatch '^[A-Za-z0-9_]+$') { Write-Host "::error::Project folder '$p' must use only letters, digits and underscores."; exit 1 }
             [ordered]@{ project = $p; key = $p.ToUpper() }
           })
-          Write-Host "Projects in this pull request: $(@($changed) -join ', ')"
+          Write-Host "Projects waiting to be promoted to Production: $(@($changed) -join ', ')"
           "matrix=$(ConvertTo-Json -InputObject $items -Compress)" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
           "any=$(($items.Count -gt 0).ToString().ToLower())" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
 
@@ -85,7 +93,9 @@ jobs:
       DB_USER_PW_CHECK: ${{ secrets[format('DB_USER_PW_CHECK_{0}', matrix.key)] }}
 
     steps: # Steps run strictly in order and stop on the first failure
-      - uses: actions/checkout@v5 # Checks out the pull request as it would look once merged
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }} # The commit the Build run tested
 
       # Fails fast if the project's secrets or a database URL this job needs are missing
       - name: Check project settings
@@ -135,7 +145,7 @@ jobs:
           build-user: ${{ env.DB_USER_CHECK }}
           build-password: ${{ env.DB_USER_PW_CHECK }}
           build-ok-to-erase: true # Check DB is a throwaway shadow, cleaned each run
-          fail-on-drift: false # Report only - set to true to block the merge when Production has drifted
-          fail-on-code-review: false # Report only - set to true to block the merge on code review violations
+          fail-on-drift: false # Report only - drift is shown in the report; the deploy itself stops on drift
+          fail-on-code-review: false # Report only - violations are shown in the report
           pre-deployment-report-name: flyway-prod-pre-deployment-report-${{ matrix.project }}
           drift-resolution-scripts-name: flyway-checks-prod-drift-resolution-scripts-${{ matrix.project }}
